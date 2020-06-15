@@ -60,6 +60,7 @@ class S3ObjList
   public:
     S3ObjList() {}
     ~S3ObjList() {}
+	void clear() { objects.clear(); }
 
     bool IsEmpty(void) const {
       return objects.empty();

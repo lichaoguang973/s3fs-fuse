@@ -254,6 +254,14 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
 static int s3fs_listxattr(const char* path, char* list, size_t size);
 static int s3fs_removexattr(const char* path, const char* name);
 
+int notry(int result)
+{
+	if (result == -ENOENT) return true;
+	if (INT_MAX  == result || result == -EIO || result == -EPERM) return false;
+	//if (INT_MAX  == result || result == -EPERM) return false;
+	return true;
+}
+
 //-------------------------------------------------------------------
 // WTF8 macros
 //-------------------------------------------------------------------
@@ -872,16 +880,18 @@ static int put_headers(const char* path, headers_t& meta, bool is_copy)
 static int s3fs_getattr(const char* _path, struct stat* stbuf)
 {
   WTF8_ENCODE(path)
-  int result;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s]", path);
 
   // check parent directory attribute.
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_access(path, F_OK, stbuf))){
-    return result;
+	goto retry;
   }
   // If has already opened fd, the st_size should be instead.
   // (See: Issue 241)
@@ -1056,8 +1066,10 @@ static int s3fs_mknod(const char *_path, mode_t mode, dev_t rdev)
 static int s3fs_create(const char* _path, mode_t mode, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
-  int result;
   struct fuse_context* pcxt;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][mode=%04o][flags=0x%x]", path, mode, fi->flags);
 
@@ -1067,20 +1079,20 @@ static int s3fs_create(const char* _path, mode_t mode, struct fuse_file_info* fi
 
   // check parent directory attribute.
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   result = check_object_access(path, W_OK, NULL);
   if(-ENOENT == result){
     if(0 != (result = check_parent_object_access(path, W_OK))){
-      return result;
+		goto retry;
     }
   }else if(0 != result){
-    return result;
+	goto retry;
   }
   result = create_file_object(path, mode, pcxt->uid, pcxt->gid);
   StatCache::getStatCacheData()->DelStat(path);
   if(result != 0){
-    return result;
+	goto retry;
   }
 
 
@@ -1089,7 +1101,8 @@ static int s3fs_create(const char* _path, mode_t mode, struct fuse_file_info* fi
   get_object_attribute(path, NULL, &meta, true, NULL, true);    // no truncate cache
   if(NULL == (ent = FdManager::get()->Open(path, &meta, 0, -1, false, true))){
     StatCache::getStatCacheData()->DelStat(path);
-    return -EIO;
+	result = -EIO;
+	goto retry;
   }
   fi->fh = ent->GetFd();
   S3FS_MALLOCTRIM(0);
@@ -1123,7 +1136,6 @@ static int create_directory_object(const char* path, mode_t mode, time_t time, u
 static int s3fs_mkdir(const char* _path, mode_t mode)
 {
   WTF8_ENCODE(path)
-  int result;
   struct fuse_context* pcxt;
 
   S3FS_PRN_INFO("[path=%s][mode=%04o]", path, mode);
@@ -1131,6 +1143,9 @@ static int s3fs_mkdir(const char* _path, mode_t mode)
   if(NULL == (pcxt = fuse_get_context())){
     return -EIO;
   }
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   // check parent directory attribute.
   if(0 != (result = check_parent_object_access(path, W_OK | X_OK))){
@@ -1140,25 +1155,27 @@ static int s3fs_mkdir(const char* _path, mode_t mode)
     if(0 == result){
       result = -EEXIST;
     }
-    return result;
+	goto retry;
   }
 
   result = create_directory_object(path, mode, time(NULL), pcxt->uid, pcxt->gid);
   StatCache::getStatCacheData()->DelStat(path);
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int s3fs_unlink(const char* _path)
 {
   WTF8_ENCODE(path)
-  int result;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s]", path);
 
   if(0 != (result = check_parent_object_access(path, W_OK | X_OK))){
-    return result;
+	  goto retry;
   }
   S3fsCurl s3fscurl;
   result = s3fscurl.DeleteRequest(path);
@@ -1167,17 +1184,20 @@ static int s3fs_unlink(const char* _path)
   StatCache::getStatCacheData()->DelSymlink(path);
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int directory_empty(const char* path)
 {
-  int result;
   S3ObjList head;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   if((result = list_bucket(path, head, "/", true)) != 0){
     S3FS_PRN_ERR("list_bucket returns error.");
-    return result;
+	head.clear();
+	goto retry;
   }
   if(!head.IsEmpty()){
     return -ENOTEMPTY;
@@ -1188,14 +1208,16 @@ static int directory_empty(const char* path)
 static int s3fs_rmdir(const char* _path)
 {
   WTF8_ENCODE(path)
-  int result;
   string strpath;
   struct stat stbuf;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s]", path);
 
   if(0 != (result = check_parent_object_access(path, W_OK | X_OK))){
-    return result;
+	  goto retry;
   }
 
   // directory must be empty
@@ -1239,7 +1261,7 @@ static int s3fs_rmdir(const char* _path)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int s3fs_symlink(const char* _from, const char* _to)
@@ -1577,20 +1599,22 @@ static int s3fs_rename(const char* _from, const char* _to)
   WTF8_ENCODE(from)
   WTF8_ENCODE(to)
   struct stat buf;
-  int result;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[from=%s][to=%s]", from, to);
 
   if(0 != (result = check_parent_object_access(to, W_OK | X_OK))){
     // not permit writing "to" object parent dir.
-    return result;
+	goto retry;
   }
   if(0 != (result = check_parent_object_access(from, W_OK | X_OK))){
     // not permit removing "from" object parent dir.
-    return result;
+	goto retry;
   }
   if(0 != (result = get_object_attribute(from, &buf, NULL))){
-    return result;
+	goto retry;
   }
 
   // flush pending writes if file is open
@@ -1598,7 +1622,7 @@ static int s3fs_rename(const char* _from, const char* _to)
   if(entity != NULL){
     if(0 != (result = entity->Flush(true))){
       S3FS_PRN_ERR("could not upload file(%s): result=%d", to, result);
-      return result;
+	  goto retry;
     }
     StatCache::getStatCacheData()->DelStat(from);
     FdManager::get()->Close(entity);
@@ -1619,7 +1643,7 @@ static int s3fs_rename(const char* _from, const char* _to)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int s3fs_link(const char* _from, const char* _to)
@@ -1633,13 +1657,15 @@ static int s3fs_link(const char* _from, const char* _to)
 static int s3fs_chmod(const char* _path, mode_t mode)
 {
   WTF8_ENCODE(path)
-  int result;
   string strpath;
   string newpath;
   string nowcache;
   headers_t meta;
   struct stat stbuf;
   dirtype nDirType = DIRTYPE_UNKNOWN;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][mode=%04o]", path, mode);
 
@@ -1648,10 +1674,10 @@ static int s3fs_chmod(const char* _path, mode_t mode)
     return -EIO;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode)){
@@ -1662,7 +1688,7 @@ static int s3fs_chmod(const char* _path, mode_t mode)
     result   = get_object_attribute(strpath.c_str(), NULL, &meta);
   }
   if(0 != result){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode) && IS_REPLACEDIR(nDirType)){
@@ -1671,13 +1697,13 @@ static int s3fs_chmod(const char* _path, mode_t mode)
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), mode, stbuf.st_mtime, stbuf.st_uid, stbuf.st_gid))){
-      return result;
+		goto retry;
     }
   }else{
     // normal object or directory object of newer version
@@ -1687,7 +1713,8 @@ static int s3fs_chmod(const char* _path, mode_t mode)
     meta["x-amz-metadata-directive"] = "REPLACE";
 
     if(put_headers(strpath.c_str(), meta, true) != 0){
-      return -EIO;
+      result = -EIO;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
@@ -1711,12 +1738,14 @@ static int s3fs_chmod(const char* _path, mode_t mode)
 static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
 {
   WTF8_ENCODE(path)
-  int         result;
   string      strpath;
   string      newpath;
   string      nowcache;
   struct stat stbuf;
   dirtype     nDirType = DIRTYPE_UNKNOWN;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO1("[path=%s][mode=%04o]", path, mode);
 
@@ -1725,10 +1754,10 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
     return -EIO;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	goto retry;
   }
 
   // Get attributes
@@ -1740,7 +1769,7 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
     result   = get_object_attribute(strpath.c_str(), NULL, NULL);
   }
   if(0 != result){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode)){
@@ -1749,13 +1778,13 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), mode, stbuf.st_mtime, stbuf.st_uid, stbuf.st_gid))){
-      return result;
+		goto retry;
     }
   }else{
     // normal object or directory object of newer version
@@ -1776,7 +1805,7 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
     if(0 != (result = ent->Flush(true))){
       S3FS_PRN_ERR("could not upload file(%s): result=%d", strpath.c_str(), result);
       FdManager::get()->Close(ent);
-      return result;
+		goto retry;
     }
     FdManager::get()->Close(ent);
 
@@ -1784,19 +1813,21 @@ static int s3fs_chmod_nocopy(const char* _path, mode_t mode)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
 {
   WTF8_ENCODE(path)
-  int result;
   string strpath;
   string newpath;
   string nowcache;
   headers_t meta;
   struct stat stbuf;
   dirtype nDirType = DIRTYPE_UNKNOWN;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][uid=%u][gid=%u]", path, (unsigned int)uid, (unsigned int)gid);
 
@@ -1805,10 +1836,10 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
     return -EIO;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	goto retry;
   }
 
   if((uid_t)(-1) == uid){
@@ -1825,7 +1856,7 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
     result   = get_object_attribute(strpath.c_str(), NULL, &meta);
   }
   if(0 != result){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode) && IS_REPLACEDIR(nDirType)){
@@ -1834,13 +1865,13 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), stbuf.st_mode, stbuf.st_mtime, uid, gid))){
-      return result;
+		goto retry;
     }
   }else{
     meta["x-amz-meta-ctime"]         = str(time(NULL));
@@ -1850,7 +1881,8 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
     meta["x-amz-metadata-directive"] = "REPLACE";
 
     if(put_headers(strpath.c_str(), meta, true) != 0){
-      return -EIO;
+      result = -EIO;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
   }
@@ -1862,12 +1894,14 @@ static int s3fs_chown(const char* _path, uid_t uid, gid_t gid)
 static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
 {
   WTF8_ENCODE(path)
-  int         result;
   string      strpath;
   string      newpath;
   string      nowcache;
   struct stat stbuf;
   dirtype     nDirType = DIRTYPE_UNKNOWN;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO1("[path=%s][uid=%u][gid=%u]", path, (unsigned int)uid, (unsigned int)gid);
 
@@ -1876,10 +1910,10 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
     return -EIO;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	goto retry;
   }
 
   if((uid_t)(-1) == uid){
@@ -1898,7 +1932,7 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
     result   = get_object_attribute(strpath.c_str(), NULL, NULL);
   }
   if(0 != result){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode)){
@@ -1907,13 +1941,13 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), stbuf.st_mode, stbuf.st_mtime, uid, gid))){
-      return result;
+		goto retry;
     }
   }else{
     // normal object or directory object of newer version
@@ -1935,7 +1969,7 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
     if(0 != (result = ent->Flush(true))){
       S3FS_PRN_ERR("could not upload file(%s): result=%d", strpath.c_str(), result);
       FdManager::get()->Close(ent);
-      return result;
+		goto retry;
     }
     FdManager::get()->Close(ent);
 
@@ -1943,7 +1977,7 @@ static int s3fs_chown_nocopy(const char* _path, uid_t uid, gid_t gid)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+	goto retry;
 }
 
 static int s3fs_utimens(const char* _path, const struct timespec ts[2])
@@ -2098,9 +2132,11 @@ static int s3fs_utimens_nocopy(const char* _path, const struct timespec ts[2])
 static int s3fs_truncate(const char* _path, off_t size)
 {
   WTF8_ENCODE(path)
-  int result;
   headers_t meta;
   FdEntity* ent = NULL;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][size=%lld]", path, static_cast<long long>(size));
 
@@ -2109,10 +2145,10 @@ static int s3fs_truncate(const char* _path, off_t size)
   }
 
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	  goto retry;
   }
   if(0 != (result = check_object_access(path, W_OK, NULL))){
-    return result;
+	  goto retry;
   }
 
   // Get file information
@@ -2120,12 +2156,13 @@ static int s3fs_truncate(const char* _path, off_t size)
     // Exists -> Get file(with size)
     if(NULL == (ent = FdManager::get()->Open(path, &meta, size, -1, false, true))){
       S3FS_PRN_ERR("could not open file(%s): errno=%d", path, errno);
-      return -EIO;
+	  result = -EIO;
+	  goto retry;
     }
     if(0 != (result = ent->Load(0, size))){
       S3FS_PRN_ERR("could not download file(%s): result=%d", path, result);
       FdManager::get()->Close(ent);
-      return result;
+	  goto retry;
     }
 
   }else{
@@ -2145,7 +2182,8 @@ static int s3fs_truncate(const char* _path, off_t size)
 
     if(NULL == (ent = FdManager::get()->Open(path, &meta, size, -1, true, true))){
       S3FS_PRN_ERR("could not open file(%s): errno=%d", path, errno);
-      return -EIO;
+	  result = -EIO;
+	  goto retry;
     }
   }
 
@@ -2153,22 +2191,24 @@ static int s3fs_truncate(const char* _path, off_t size)
   if(0 != (result = ent->Flush(true))){
     S3FS_PRN_ERR("could not upload file(%s): result=%d", path, result);
     FdManager::get()->Close(ent);
-    return result;
+    goto retry;
   }
   FdManager::get()->Close(ent);
 
   StatCache::getStatCacheData()->DelStat(path);
   S3FS_MALLOCTRIM(0);
 
-  return result;
+    goto retry;
 }
 
 static int s3fs_open(const char* _path, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
-  int result;
   struct stat st;
   bool needs_flush = false;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][flags=0x%x]", path, fi->flags);
 
@@ -2185,16 +2225,16 @@ static int s3fs_open(const char* _path, struct fuse_file_info* fi)
 
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK);
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
 
   result = check_object_access(path, mask, &st);
   if(-ENOENT == result){
     if(0 != (result = check_parent_object_access(path, W_OK))){
-      return result;
+		goto retry;
     }
   }else if(0 != result){
-    return result;
+	goto retry;
   }
 
   if((unsigned int)fi->flags & O_TRUNC){
@@ -2212,7 +2252,8 @@ static int s3fs_open(const char* _path, struct fuse_file_info* fi)
   get_object_attribute(path, NULL, &meta, true, NULL, true);    // no truncate cache
   if(NULL == (ent = FdManager::get()->Open(path, &meta, st.st_size, st.st_mtime, false, true))){
     StatCache::getStatCacheData()->DelStat(path);
-    return -EIO;
+	  result = -EIO;
+	goto retry;
   }
   
   if (needs_flush){
@@ -2220,7 +2261,7 @@ static int s3fs_open(const char* _path, struct fuse_file_info* fi)
       S3FS_PRN_ERR("could not upload file(%s): result=%d", path, result);
       FdManager::get()->Close(ent);
       StatCache::getStatCacheData()->DelStat(path);
-      return result;
+		goto retry;
     }
   }
 
@@ -2234,13 +2275,17 @@ static int s3fs_read(const char* _path, char* buf, size_t size, off_t offset, st
 {
   WTF8_ENCODE(path)
   ssize_t res;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_DBG("[path=%s][size=%zu][offset=%lld][fd=%llu]", path, size, static_cast<long long>(offset), (unsigned long long)(fi->fh));
 
   FdEntity* ent;
   if(NULL == (ent = FdManager::get()->ExistOpen(path, static_cast<int>(fi->fh)))){
     S3FS_PRN_ERR("could not find opened fd(%s)", path);
-    return -EIO;
+    result = -EIO;
+	goto retry;
   }
   if(ent->GetFd() != static_cast<int>(fi->fh)){
     S3FS_PRN_WARN("different fd(%d - %llu)", ent->GetFd(), (unsigned long long)(fi->fh));
@@ -2259,20 +2304,25 @@ static int s3fs_read(const char* _path, char* buf, size_t size, off_t offset, st
   }
   FdManager::get()->Close(ent);
 
-  return static_cast<int>(res);
+  result = static_cast<int>(res);
+  goto retry;
 }
 
 static int s3fs_write(const char* _path, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
   ssize_t res;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_DBG("[path=%s][size=%zu][offset=%lld][fd=%llu]", path, size, static_cast<long long int>(offset), (unsigned long long)(fi->fh));
 
   FdEntity* ent;
   if(NULL == (ent = FdManager::get()->ExistOpen(path, static_cast<int>(fi->fh)))){
     S3FS_PRN_ERR("could not find opened fd(%s)", path);
-    return -EIO;
+    result = -EIO;
+	goto retry;
   }
   if(ent->GetFd() != static_cast<int>(fi->fh)){
     S3FS_PRN_WARN("different fd(%d - %llu)", ent->GetFd(), (unsigned long long)(fi->fh));
@@ -2282,7 +2332,8 @@ static int s3fs_write(const char* _path, const char* buf, size_t size, off_t off
   }
   FdManager::get()->Close(ent);
 
-  return static_cast<int>(res);
+  result = static_cast<int>(res);
+  goto retry;
 }
 
 static int s3fs_statfs(const char* _path, struct statvfs* stbuf)
@@ -2300,21 +2351,23 @@ static int s3fs_statfs(const char* _path, struct statvfs* stbuf)
 static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
-  int result;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
 
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK);
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   result = check_object_access(path, mask, NULL);
   if(-ENOENT == result){
     if(0 != (result = check_parent_object_access(path, W_OK))){
-      return result;
+		goto retry;
     }
   }else if(0 != result){
-    return result;
+	goto retry;
   }
 
   FdEntity* ent;
@@ -2325,7 +2378,7 @@ static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 // [NOTICE]
@@ -2334,7 +2387,9 @@ static int s3fs_flush(const char* _path, struct fuse_file_info* fi)
 static int s3fs_fsync(const char* _path, int datasync, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
-  int result = 0;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
 
@@ -2351,13 +2406,16 @@ static int s3fs_fsync(const char* _path, int datasync, struct fuse_file_info* fi
   // Issue 320: Delete stat cache entry because st_size may have changed.
   StatCache::getStatCacheData()->DelStat(path);
 
-  return result;
+  goto retry;
 }
 
 static int s3fs_release(const char* _path, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
   S3FS_PRN_INFO("[path=%s][fd=%llu]", path, (unsigned long long)(fi->fh));
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   // [NOTE]
   // All opened file's stats is cached with no truncate flag.
@@ -2377,7 +2435,8 @@ static int s3fs_release(const char* _path, struct fuse_file_info* fi)
   FdEntity* ent;
   if(NULL == (ent = FdManager::get()->GetFdEntity(path, static_cast<int>(fi->fh)))){
     S3FS_PRN_ERR("could not find fd(file=%s)", path);
-    return -EIO;
+    result = -EIO;
+	goto retry;
   }
   if(ent->GetFd() != static_cast<int>(fi->fh)){
     S3FS_PRN_WARN("different fd(%d - %llu)", ent->GetFd(), (unsigned long long)(fi->fh));
@@ -2401,8 +2460,10 @@ static int s3fs_release(const char* _path, struct fuse_file_info* fi)
 static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
-  int result;
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK) | X_OK;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s][flags=0x%x]", path, fi->flags);
 
@@ -2411,7 +2472,7 @@ static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static bool multi_head_callback(S3fsCurl* s3fscurl)
@@ -2551,18 +2612,20 @@ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, of
 {
   WTF8_ENCODE(path)
   S3ObjList head;
-  int result;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   S3FS_PRN_INFO("[path=%s]", path);
 
   if(0 != (result = check_object_access(path, X_OK, NULL))){
-    return result;
+	goto retry;
   }
 
   // get a list of all the objects
   if((result = list_bucket(path, head, "/")) != 0){
     S3FS_PRN_ERR("list_bucket returns error(%d).", result);
-    return result;
+	goto retry;
   }
 
   // force to add "." and ".." name.
@@ -2582,7 +2645,7 @@ static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, of
   }
   S3FS_MALLOCTRIM(0);
 
-  return result;
+  goto retry;
 }
 
 static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only)
@@ -3163,7 +3226,6 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
   }
 #endif
 
-  int         result;
   string      strpath;
   string      newpath;
   string      nowcache;
@@ -3171,15 +3233,20 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
   struct stat stbuf;
   dirtype     nDirType = DIRTYPE_UNKNOWN;
 
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
+
   if(0 == strcmp(path, "/")){
     S3FS_PRN_ERR("Could not change mode for mount point.");
-    return -EIO;
+    result = -EIO;
+	goto retry;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode)){
@@ -3190,12 +3257,12 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
     result   = get_object_attribute(strpath.c_str(), NULL, &meta);
   }
   if(0 != result){
-    return result;
+	goto retry;
   }
 
   // make new header_t
   if(0 != (result = set_xattrs_to_header(meta, name, value, size, flags))){
-    return result;
+	goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode) && IS_REPLACEDIR(nDirType)){
@@ -3204,13 +3271,13 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+		goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), stbuf.st_mode, stbuf.st_mtime, stbuf.st_uid, stbuf.st_gid))){
-      return result;
+		goto retry;
     }
 
     // need to set xattr header for directory.
@@ -3224,7 +3291,8 @@ static int s3fs_setxattr(const char* path, const char* name, const char* value, 
   meta["x-amz-metadata-directive"] = "REPLACE";
 
   if(0 != put_headers(strpath.c_str(), meta, true)){
-    return -EIO;
+    result = -EIO;
+	goto retry;
   }
   StatCache::getStatCacheData()->DelStat(nowcache);
 
@@ -3250,18 +3318,21 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
   }
 #endif
 
-  int       result;
   headers_t meta;
   xattrs_t  xattrs;
 
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
+
   // check parent directory attribute.
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
 
   // get headers
   if(0 != (result = get_object_attribute(path, NULL, &meta))){
-    return result;
+	goto retry;
   }
 
   // get xattrs
@@ -3303,7 +3374,8 @@ static int s3fs_getxattr(const char* path, const char* name, char* value, size_t
   }
   free_xattrs(xattrs);
 
-  return static_cast<int>(length);
+  result = static_cast<int>(length);
+  goto retry;
 }
 
 static int s3fs_listxattr(const char* path, char* list, size_t size)
@@ -3314,18 +3386,20 @@ static int s3fs_listxattr(const char* path, char* list, size_t size)
     return -EIO;
   }
 
-  int       result;
   headers_t meta;
   xattrs_t  xattrs;
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
   // check parent directory attribute.
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	goto retry;
   }
 
   // get headers
   if(0 != (result = get_object_attribute(path, NULL, &meta))){
-    return result;
+	goto retry;
   }
 
   // get xattrs
@@ -3382,7 +3456,6 @@ static int s3fs_removexattr(const char* path, const char* name)
     return -EIO;
   }
 
-  int         result;
   string      strpath;
   string      newpath;
   string      nowcache;
@@ -3391,15 +3464,19 @@ static int s3fs_removexattr(const char* path, const char* name)
   struct stat stbuf;
   dirtype     nDirType = DIRTYPE_UNKNOWN;
 
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
+
   if(0 == strcmp(path, "/")){
     S3FS_PRN_ERR("Could not change mode for mount point.");
     return -EIO;
   }
   if(0 != (result = check_parent_object_access(path, X_OK))){
-    return result;
+	  goto retry;
   }
   if(0 != (result = check_object_owner(path, &stbuf))){
-    return result;
+	  goto retry;
   }
 
   if(S_ISDIR(stbuf.st_mode)){
@@ -3410,7 +3487,7 @@ static int s3fs_removexattr(const char* path, const char* name)
     result   = get_object_attribute(strpath.c_str(), NULL, &meta);
   }
   if(0 != result){
-    return result;
+	  goto retry;
   }
 
   // get xattrs
@@ -3448,14 +3525,14 @@ static int s3fs_removexattr(const char* path, const char* name)
 
     // At first, remove directory old object
     if(0 != (result = remove_old_type_dir(strpath, nDirType))){
-      return result;
+	  goto retry;
     }
     StatCache::getStatCacheData()->DelStat(nowcache);
 
     // Make new directory object("dir/")
     if(0 != (result = create_directory_object(newpath.c_str(), stbuf.st_mode, stbuf.st_mtime, stbuf.st_uid, stbuf.st_gid))){
       free_xattrs(xattrs);
-      return result;
+	  goto retry;
     }
 
     // need to set xattr header for directory.
@@ -3469,7 +3546,8 @@ static int s3fs_removexattr(const char* path, const char* name)
 
   if(0 != put_headers(strpath.c_str(), meta, true)){
     free_xattrs(xattrs);
-    return -EIO;
+    result = -EIO;
+	  goto retry;
   }
   StatCache::getStatCacheData()->DelStat(nowcache);
 
@@ -3561,10 +3639,13 @@ static int s3fs_access(const char* path, int mask)
           ((mask & W_OK) == W_OK) ? "W_OK " : "",
           ((mask & X_OK) == X_OK) ? "X_OK " : "",
           (mask == F_OK) ? "F_OK" : "");
+  int result = INT_MAX;
+retry:
+  if (notry(result)) return result;
 
-  int result = check_object_access(path, mask, NULL);
+  result = check_object_access(path, mask, NULL);
   S3FS_MALLOCTRIM(0);
-  return result;
+  goto retry;
 }
 
 static xmlChar* get_exp_value_xml(xmlDocPtr doc, xmlXPathContextPtr ctx, const char* exp_key)
