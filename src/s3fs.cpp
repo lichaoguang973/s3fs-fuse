@@ -156,6 +156,51 @@ static const std::string keyval_fields_type    = "\t";       // special key for 
 static const std::string aws_accesskeyid       = "AWSAccessKeyId";
 static const std::string aws_secretkey         = "AWSSecretKey";
 
+// SM
+typedef std::map<long, std::string> Pos2Marker;
+typedef std::map<std::string, Pos2Marker> PathPos2Marker;
+typedef std::map<std::string, int> InterruptDefinition;
+InterruptDefinition m_interrupt;
+PathPos2Marker m_markerMap;
+pthread_mutex_t m_mmMutex;
+
+static void add_marker(const char* path, long pos, const std::string &marker)
+{
+    AutoLock lock(&m_mmMutex);
+	m_markerMap[std::string(path)][pos] = marker;
+}
+
+static bool get_marker(const char *path, long pos, std::string &marker)
+{
+    AutoLock lock(&m_mmMutex);
+	PathPos2Marker::iterator it = m_markerMap.find(std::string(path));
+	if (it == m_markerMap.end()) return false;
+	Pos2Marker::iterator it2 = it->second.find(pos);
+	if (it2 == it->second.end()) return false;
+	marker = it2->second;
+	return true;
+}
+
+static void clear_marker(const char* path)
+{
+    AutoLock lock(&m_mmMutex);
+	std::string str = path;
+	if (m_markerMap.find(str) != m_markerMap.end()) m_markerMap.erase(str);
+}
+
+static bool has_interrupt(const char* path)
+{
+    AutoLock lock(&m_mmMutex);
+	std::string str = path;
+	for (InterruptDefinition::iterator it = m_interrupt.begin(); it != m_interrupt.end(); it++) {
+		if (str.find_first_of(it->first) == 0) {
+			m_interrupt.erase(it);
+			return true;
+		}
+	}
+	return false;
+}
+
 //-------------------------------------------------------------------
 // Static functions : prototype
 //-------------------------------------------------------------------
@@ -174,7 +219,7 @@ static FdEntity* get_local_fent(const char* path, bool is_load = false);
 static bool multi_head_callback(S3fsCurl* s3fscurl);
 static S3fsCurl* multi_head_retry_callback(S3fsCurl* s3fscurl);
 static int readdir_multi_head(const char* path, const S3ObjList& head, void* buf, fuse_fill_dir_t filler);
-static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only = false);
+static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only = false, long pos = -1);
 static int directory_empty(const char* path);
 static bool is_truncated(xmlDocPtr doc);
 static int append_objects_from_xml_ex(const char* path, xmlDocPtr doc, xmlXPathContextPtr ctx, 
@@ -880,6 +925,13 @@ static int put_headers(const char* path, headers_t& meta, bool is_copy)
 static int s3fs_getattr(const char* _path, struct stat* stbuf)
 {
   WTF8_ENCODE(path)
+
+    char ppp[256];	// SM
+	if (const char *p = strstr(path, "/@")) {
+		strcpy(ppp, path);
+		*(ppp + (p - path)) = '\0';
+		path = ppp;
+	}
   int result = INT_MAX;
 retry:
   if (notry(result)) return result;
@@ -2461,6 +2513,12 @@ static int s3fs_opendir(const char* _path, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
   int mask = (O_RDONLY != (fi->flags & O_ACCMODE) ? W_OK : R_OK) | X_OK;
+    char ppp[256];	// SM
+	if (const char *p = strstr(path, "/@")) {
+		strcpy(ppp, path);
+		*(ppp + (p - path)) = '\0';
+		path = ppp;
+	}
   int result = INT_MAX;
 retry:
   if (notry(result)) return result;
@@ -2611,6 +2669,15 @@ static int readdir_multi_head(const char* path, const S3ObjList& head, void* buf
 static int s3fs_readdir(const char* _path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi)
 {
   WTF8_ENCODE(path)
+    char ppp[256];  // SM
+    long pos = -1;
+	if (const char *p = strstr(path, "/@")) {
+		strcpy(ppp, path);
+		*(ppp + (p - path)) = '\0';
+		path = ppp;
+		p += 2;
+		if (*p != '\0') pos = atol(p);
+	}
   S3ObjList head;
   int result = INT_MAX;
 retry:
@@ -2623,7 +2690,8 @@ retry:
   }
 
   // get a list of all the objects
-  if((result = list_bucket(path, head, "/")) != 0){
+  head.clear();
+  if((result = list_bucket(path, head, "/", false, pos > 0 ? (pos - (pos % max_keys_list_object)) : pos)) != 0){		// SM
     S3FS_PRN_ERR("list_bucket returns error(%d).", result);
 	goto retry;
   }
@@ -2648,7 +2716,7 @@ retry:
   goto retry;
 }
 
-static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only)
+static int list_bucket(const char* path, S3ObjList& head, const char* delimiter, bool check_content_only, long pos)
 {
   string    s3_realpath;
   string    query_delimiter;;
@@ -2658,8 +2726,11 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
   bool      truncated = true;
   S3fsCurl  s3fscurl;
   xmlDocPtr doc;
+  long start_pos = pos;
 
   S3FS_PRN_INFO1("[path=%s]", path);
+
+  if (pos > 0 && !get_marker(path, pos, next_marker)) return 0;
 
   if(delimiter && 0 < strlen(delimiter)){
     query_delimiter += "delimiter=";
@@ -2683,7 +2754,7 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     query_maxkey += "max-keys=" + str(max_keys_list_object);
   }
 
-  while(truncated){
+  while(truncated && (pos < 0 || start_pos <= pos)){		// SM
     string each_query = query_delimiter;
     if(!next_marker.empty()){
       each_query += "marker=" + urlEncode(next_marker) + "&";
@@ -2712,8 +2783,9 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     }
     if(true == (truncated = is_truncated(doc))){
       xmlChar*	tmpch = get_next_marker(doc);
+	  std::string old_mk = next_marker;
       if(tmpch){
-        next_marker = (char*)tmpch;
+		next_marker = (char*)tmpch;
         xmlFree(tmpch);
       }else{
         // If did not specify "delimiter", s3 did not return "NextMarker".
@@ -2731,7 +2803,15 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
           next_marker += lastname;
         }
       }
-    }
+		if (pos >= 0) {
+			start_pos += max_keys_list_object;
+			S3FS_PRN_ERR("list_bucket get new pos:marker %ld:%s for path %s", start_pos, next_marker.c_str(), path);
+			add_marker(path, start_pos, next_marker);
+		}
+	} else if (pos >= 0) {
+		S3FS_PRN_ERR("list_bucket reach end for %s %ld", path, start_pos);
+	}
+
     S3FS_XMLFREEDOC(doc);
 
     // reset(initialize) curl object
@@ -2740,6 +2820,11 @@ static int list_bucket(const char* path, S3ObjList& head, const char* delimiter,
     if(check_content_only){
       break;
     }
+
+	if (has_interrupt(path)) {
+		S3FS_PRN_ERR("list_bucket interrupted for %s", path);
+		break;
+	}
   }
   S3FS_MALLOCTRIM(0);
 
@@ -3619,6 +3704,13 @@ static void* s3fs_init(struct fuse_conn_info* conn)
      conn->want |= FUSE_CAP_BIG_WRITES;
   }
 
+  pthread_mutexattr_t attr;
+  pthread_mutexattr_init(&attr);
+  if (0 != pthread_mutex_init(&m_mmMutex, &attr)) {
+    S3FS_PRN_ERR("Init m_mmMutex failed");
+    return NULL;
+  }
+
   return NULL;
 }
 
@@ -3630,6 +3722,8 @@ static void s3fs_destroy(void*)
   if(is_remove_cache && (!CacheFileStat::DeleteCacheFileStatDirectory() || !FdManager::DeleteCacheDirectory())){
     S3FS_PRN_WARN("Could not remove cache directory.");
   }
+  
+  pthread_mutex_destroy(&m_mmMutex);
 }
 
 static int s3fs_access(const char* path, int mask)
@@ -5421,11 +5515,15 @@ int main(int argc, char* argv[])
     exit(EXIT_FAILURE);
   }
   if(!S3fsCurl::IsPublicBucket() && !load_iamrole && !is_ecs){
-    if(EXIT_SUCCESS != get_access_keys()){
+    /*if(EXIT_SUCCESS != get_access_keys()){
       S3fsCurl::DestroyS3fsCurl();
       s3fs_destroy_global_ssl();
       exit(EXIT_FAILURE);
-    }
+    }*/
+	if(!S3fsCurl::SetAccessKey("AKDD002E38WQT78K6ZWHMDRRSZYMNX", "ASDD4yRDBS42EG9UaS5mLy7A1TCJ4cX00ATcF6wT")) {
+	  S3FS_PRN_EXIT("failed to set access key/secret key.");
+	  return -1;
+	}
     if(!S3fsCurl::IsSetAccessKeys()){
       S3FS_PRN_EXIT("could not establish security credentials, check documentation.");
       S3fsCurl::DestroyS3fsCurl();
